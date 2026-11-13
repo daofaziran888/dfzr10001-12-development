@@ -1,4 +1,4 @@
-"""采集告警接口：维护告警规则，覆盖提交校验、启用配置、停用配置等动作。"""
+"""采集告警接口：维护告警规则，并提供告警聚合、恢复与历史通知能力。"""
 from __future__ import annotations
 
 from typing import Any
@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.alert import AlertService
+from app.services.alert_engine import alert_engine
 
 router = APIRouter(prefix="/api/alert", tags=["采集告警"])
 
@@ -63,3 +64,81 @@ def export_entries() -> dict[str, Any]:
     """导出采集告警清单：返回当前过滤条件下的全量数据。"""
     items, total = service.list_entries(page=1, size=10000)
     return {"module": "alert", "total": total, "items": items}
+
+
+# ------------------------------------------------------------------ 告警聚合与恢复
+@router.post("/engine/events")
+def ingest_event(payload: EntryPayload) -> dict[str, Any]:
+    """受理一条采集失败告警事件。
+
+    停用/草稿规则直接拒收；静默期内只累计，窗口结束由 engine/tick 结算成一份摘要。
+    values 支持：rule（告警编号或 id）、content、occurred_at。
+    """
+    values = payload.values
+    rule_ref = values.get("rule") or values.get("rule_id") or values.get("告警编号")
+    if rule_ref is None:
+        raise HTTPException(status_code=400, detail="必须指定告警规则 rule（告警编号或 id）")
+    result = alert_engine.ingest(
+        rule_ref,
+        content=str(values.get("content") or ""),
+        occurred_at=values.get("occurred_at"),
+    )
+    return result
+
+
+@router.post("/engine/tick")
+def engine_tick(payload: EntryPayload | None = None) -> dict[str, Any]:
+    """推进聚合时钟：结算所有到期窗口并尝试发送摘要。"""
+    now = payload.values.get("now") if payload and payload.values else None
+    closed = alert_engine.tick(now)
+    return {"closed": len(closed), "packages": closed}
+
+
+@router.post("/engine/recoveries")
+def recover_event(payload: EntryPayload) -> dict[str, Any]:
+    """以原告警事件为目标执行恢复；重复/并发恢复只生效一次。"""
+    values = payload.values
+    result = alert_engine.recover(
+        event_id=values.get("event_id"),
+        package_id=values.get("package_id"),
+        rule_ref=values.get("rule"),
+        now=values.get("now"),
+    )
+    return result
+
+
+@router.post("/engine/packages/{package_id}/retry")
+def retry_package(package_id: str, payload: EntryPayload | None = None) -> dict[str, Any]:
+    """发送失败后从原聚合包继续发送。"""
+    now = payload.values.get("now") if payload and payload.values else None
+    return alert_engine.retry_package(package_id, now)
+
+
+@router.get("/engine/state")
+def engine_state() -> dict[str, Any]:
+    """聚合引擎运行态：事件、聚合包、工作台待处理项、历史通知、恢复记录。"""
+    return {
+        "events": alert_engine.list_events(),
+        "packages": alert_engine.list_packages(),
+        "workbench": alert_engine.list_workbench(),
+        "notifications": alert_engine.list_notifications(),
+        "recoveries": alert_engine.list_recoveries(),
+    }
+
+
+@router.post("/engine/reset")
+def engine_reset() -> dict[str, Any]:
+    """清空引擎运行态，便于按验收序列重新回放。"""
+    alert_engine.reset()
+    return {"ok": True, "message": "聚合引擎运行态已清空"}
+
+
+@router.post("/engine/notifier")
+def set_notifier(payload: EntryPayload) -> dict[str, Any]:
+    """注入通知渠道故障模式：ok / fail / fail_once，用于验证发送失败续发。"""
+    mode = str(payload.values.get("mode") or "").strip()
+    try:
+        current = alert_engine.set_notifier(mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "notifier_mode": current}

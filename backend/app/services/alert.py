@@ -58,4 +58,9 @@ class AlertService:
         entry["status"] = target
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
+        # 聚合引擎同时读取状态与启用标记，两个口径必须保持一致，避免绕过停用条件
+        if target == "已启用":
+            entry["是否启用"] = "是"
+        elif target == "已停用":
+            entry["是否启用"] = "否"
         return entry, f"告警规则已{action}"
